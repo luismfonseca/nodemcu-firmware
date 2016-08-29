@@ -59,14 +59,28 @@
                          "Sec-WebSocket-Protocol: chat\r\n"\
                          "Sec-WebSocket-Version: 13\r\n"\
                          "\r\n"
-
 #define WS_INIT_HEADERS_LENGTH 169
+
+#define WS_INIT_SERVER_HEADERS "HTTP/1.1 101 Switching Protocols\r\n"\
+                               "Upgrade: websocket\r\n"\
+                               "Connection: Upgrade\r\n"\
+                               "Sec-WebSocket-Accept: %s\r\n"\
+                               "%s"\
+                               "\r\n"
+#define WS_INIT_SERVER_HEADERS_LENGTH 129
+
+#define WS_HTTP_UPGRADE_WEBSOCKET "Upgrade: websocket\r\n"
+#define WS_HTTP_CONNECTION_UPGRADE "Connection: Upgrade\r\n"
+#define WS_HTTP_SEC_WEBSOCKET_KEY "Sec-Websocket-Key:"
+#define WS_HTTP_SEC_WEBSOCKET_KEY_LENGTH 21
+
 #define WS_GUID "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 #define WS_GUID_LENGTH 36
 
 #define WS_HTTP_SWITCH_PROTOCOL_HEADER "HTTP/1.1 101"
 #define WS_HTTP_SEC_WEBSOCKET_ACCEPT "Sec-WebSocket-Accept:"
 
+#define WS_SERVER_CONNECT_TIMEOUT_MS 30 * 1000
 #define WS_CONNECT_TIMEOUT_MS 10 * 1000
 #define WS_PING_INTERVAL_MS 30 * 1000
 #define WS_FORCE_CLOSE_TIMEOUT_MS 5 * 1000
@@ -110,6 +124,18 @@ static char *base64Encode(char *data, unsigned int len) {
   return out; // Requires free
 }
 
+static void generateSecAcceptKey(const char *key, char **expectedKey) {
+  // expectedKey = b64(sha1(keyB64 + GUID))
+  char keyWithGuid[24 + WS_GUID_LENGTH];
+  memcpy(keyWithGuid, key, 24);
+  memcpy(keyWithGuid + 24, WS_GUID, WS_GUID_LENGTH);
+
+  char *keyEncrypted = cryptoSha1(keyWithGuid, 24 + WS_GUID_LENGTH);
+  *expectedKey = base64Encode(keyEncrypted, 20);
+
+  os_free(keyEncrypted);
+}
+
 static void generateSecKeys(char **key, char **expectedKey) {
   char rndData[16];
   int i;
@@ -119,21 +145,17 @@ static void generateSecKeys(char **key, char **expectedKey) {
 
   *key = base64Encode(rndData, 16);
 
-  // expectedKey = b64(sha1(keyB64 + GUID))
-  char keyWithGuid[24 + WS_GUID_LENGTH];
-  memcpy(keyWithGuid, *key, 24);
-  memcpy(keyWithGuid + 24, WS_GUID, WS_GUID_LENGTH);
-
-  char *keyEncrypted = cryptoSha1(keyWithGuid, 24 + WS_GUID_LENGTH);
-  *expectedKey = base64Encode(keyEncrypted, 20);
-
-  os_free(keyEncrypted);
+  generateSecAcceptKey(*key, expectedKey);
 }
 
-static void ws_closeSentCallback(void *arg) {
-  NODE_DBG("ws_closeSentCallback \n");
+static void sent_noop(void *arg) {
+  NODE_DBG("sent_noop \n");
+}
+
+static void wsc_closeSentCallback(void *arg) {
+  NODE_DBG("wsc_closeSentCallback \n");
   struct espconn *conn = (struct espconn *) arg;
-  ws_info *ws = (ws_info *) conn->reverse;
+  wsc_info *ws = (wsc_info *) conn->reverse;
 
   if (ws == NULL) {
     NODE_DBG("ws is unexpectly null\n");
@@ -148,9 +170,9 @@ static void ws_closeSentCallback(void *arg) {
     espconn_disconnect(conn);
 }
 
-static void ws_sendFrame(struct espconn *conn, int opCode, const char *data, unsigned short len) {
-  NODE_DBG("ws_sendFrame %d %d\n", opCode, len);
-  ws_info *ws = (ws_info *) conn->reverse;
+static void wsc_sendFrame(struct espconn *conn, int opCode, const char *data, unsigned short len) {
+  NODE_DBG("wsc_sendFrame %d %d\n", opCode, len);
+  wsc_info *ws = (wsc_info *) conn->reverse;
   
   if (ws->connectionState == 4) {
     NODE_DBG("already in closing state\n");
@@ -174,7 +196,7 @@ static void ws_sendFrame(struct espconn *conn, int opCode, const char *data, uns
 
   b[0] = 1 << 7; // has fin
   b[0] += opCode;
-  b[1] = 1 << 7; // has mask
+  b[1] = ws->applyMask << 7; // mask bit
   int bufOffset;
   if (len < 126) {
     b[1] += len;
@@ -193,20 +215,24 @@ static void ws_sendFrame(struct espconn *conn, int opCode, const char *data, uns
     bufOffset = 6;
   }
 
-  // Random mask:
-  b[bufOffset] = (char) os_random();
-  b[bufOffset + 1] = (char) os_random();
-  b[bufOffset + 2] = (char) os_random();
-  b[bufOffset + 3] = (char) os_random();
-  bufOffset += 4;
+  // Random mask, if needed
+  if (ws->applyMask) {
+    b[bufOffset] = (char) os_random();
+    b[bufOffset + 1] = (char) os_random();
+    b[bufOffset + 2] = (char) os_random();
+    b[bufOffset + 3] = (char) os_random();
+    bufOffset += 4;
+  }
 
   // Copy data to buffer
   memcpy(b + bufOffset, data, len);
 
-  // Apply mask to encode payload
-  int i;
-  for (i = 0; i < len; i++) {
-    b[bufOffset + i] ^= b[bufOffset - 4 + i % 4]; 
+  // Apply mask to encode payload, if needed
+  if (ws->applyMask) {
+    int i;
+    for (i = 0; i < len; i++) {
+      b[bufOffset + i] ^= b[bufOffset - 4 + i % 4];
+    }
   }
   bufOffset += len;
 
@@ -230,10 +256,10 @@ static void ws_sendFrame(struct espconn *conn, int opCode, const char *data, uns
   os_free(b);
 }
 
-static void ws_sendPingTimeout(void *arg) {
-  NODE_DBG("ws_sendPingTimeout \n");
+static void wsc_sendPingTimeout(void *arg) {
+  NODE_DBG("wsc_sendPingTimeout \n");
   struct espconn *conn = (struct espconn *) arg;
-  ws_info *ws = (ws_info *) conn->reverse;
+  wsc_info *ws = (wsc_info *) conn->reverse;
 
   if (ws->unhealthyPoints == WS_UNHEALTHY_THRESHOLD) {
     // several pings were sent but no pongs nor messages
@@ -246,14 +272,14 @@ static void ws_sendPingTimeout(void *arg) {
     return;
   }
 
-  ws_sendFrame(conn, WS_OPCODE_PING, NULL, 0);
+  wsc_sendFrame(conn, WS_OPCODE_PING, NULL, 0);
   ws->unhealthyPoints += 1;
 }
 
-static void ws_receiveCallback(void *arg, char *buf, unsigned short len) {
-  NODE_DBG("ws_receiveCallback %d \n", len);
+static void wsc_receiveCallback(void *arg, char *buf, unsigned short len) {
+  NODE_DBG("wsc_receiveCallback %d \n", len);
   struct espconn *conn = (struct espconn *) arg;
-  ws_info *ws = (ws_info *) conn->reverse;
+  wsc_info *ws = (wsc_info *) conn->reverse;
 
   ws->unhealthyPoints = 0; // received data, connection is healthy
   os_timer_disarm(&ws->timeoutTimer); // reset ping check
@@ -446,11 +472,11 @@ static void ws_receiveCallback(void *arg, char *buf, unsigned short len) {
       if (opCode == WS_OPCODE_CLOSE) {
         NODE_DBG("Closing message: %s\n", payload); // Must not be shown to client as per spec
 
-        espconn_regist_sentcb(conn, ws_closeSentCallback);
-        ws_sendFrame(conn, WS_OPCODE_CLOSE, (const char *) (b + bufOffset), (unsigned short) payloadLength);
+        espconn_regist_sentcb(conn, wsc_closeSentCallback);
+        wsc_sendFrame(conn, WS_OPCODE_CLOSE, (const char *) (b + bufOffset), (unsigned short) payloadLength);
         ws->connectionState = 4;
       } else if (opCode == WS_OPCODE_PING) {
-        ws_sendFrame(conn, WS_OPCODE_PONG, (const char *) (b + bufOffset), (unsigned short) payloadLength);
+        wsc_sendFrame(conn, WS_OPCODE_PONG, (const char *) (b + bufOffset), (unsigned short) payloadLength);
       } else if (opCode == WS_OPCODE_PONG) {
         // ping alarm was already reset...
       } else {
@@ -494,10 +520,10 @@ static void ws_receiveCallback(void *arg, char *buf, unsigned short len) {
   }
 }
 
-static void ws_initReceiveCallback(void *arg, char *buf, unsigned short len) {
-  NODE_DBG("ws_initReceiveCallback %d \n", len);
+static void wsc_initReceiveCallback(void *arg, char *buf, unsigned short len) {
+  NODE_DBG("wsc_initReceiveCallback %d \n", len);
   struct espconn *conn = (struct espconn *) arg;
-  ws_info *ws = (ws_info *) conn->reverse;
+  wsc_info *ws = (wsc_info *) conn->reverse;
 
   // Check server is switch protocols
   if (strstr(buf, WS_HTTP_SWITCH_PROTOCOL_HEADER) == NULL) {
@@ -524,10 +550,10 @@ static void ws_initReceiveCallback(void *arg, char *buf, unsigned short len) {
   NODE_DBG("Server response is valid, it's now a websocket!\n");
 
   os_timer_disarm(&ws->timeoutTimer);
-  os_timer_setfn(&ws->timeoutTimer, (os_timer_func_t *) ws_sendPingTimeout, conn);
+  os_timer_setfn(&ws->timeoutTimer, (os_timer_func_t *) wsc_sendPingTimeout, conn);
   os_timer_arm(&ws->timeoutTimer, WS_PING_INTERVAL_MS, true);
 
-  espconn_regist_recvcb(conn, ws_receiveCallback);
+  espconn_regist_recvcb(conn, wsc_receiveCallback);
 
   if (ws->onConnection) ws->onConnection(ws);
 
@@ -537,17 +563,17 @@ static void ws_initReceiveCallback(void *arg, char *buf, unsigned short len) {
   NODE_DBG("dataLength = %d\n", len - (data - buf) - 4);
 
   if (data != NULL && dataLength > 0) { // handshake already contained a frame
-    ws_receiveCallback(arg, data + 4, dataLength);
+    wsc_receiveCallback(arg, data + 4, dataLength);
   }
 }
 
 static void connect_callback(void *arg) {
   NODE_DBG("Connected\n");
   struct espconn *conn = (struct espconn *) arg;
-  ws_info *ws = (ws_info *) conn->reverse;
+  wsc_info *ws = (wsc_info *) conn->reverse;
   ws->connectionState = 3;
 
-  espconn_regist_recvcb(conn, ws_initReceiveCallback);
+  espconn_regist_recvcb(conn, wsc_initReceiveCallback);
 
   char *key;
   generateSecKeys(&key, &ws->expectedSecKey);
@@ -567,16 +593,30 @@ static void connect_callback(void *arg) {
 static void disconnect_callback(void *arg) {
   NODE_DBG("disconnect_callback\n");
   struct espconn *conn = (struct espconn *) arg;
-  ws_info *ws = (ws_info *) conn->reverse;
+  wsc_info *ws = (wsc_info *) conn->reverse;
+
+  NODE_DBG("wsc_info *ws = %d\n", ws);
+  NODE_DBG("conn %d\n", conn);
+
+  if (ws == NULL) {
+    // expected when server got an invalid connection
+    return;
+  }
+  NODE_DBG("conn2 = %d\n", ws->conn);
 
   ws->connectionState = 4;
 
   os_timer_disarm(&ws->timeoutTimer);
 
-  NODE_DBG("ws->hostname %d\n", ws->hostname);
-  os_free(ws->hostname);
-  NODE_DBG("ws->path %d\n ", ws->path);
-  os_free(ws->path);
+  if (ws->hostname != NULL) {
+    NODE_DBG("ws->hostname %d\n", ws->hostname);
+    os_free(ws->hostname);
+  }
+
+  if (ws->path != NULL) {
+    NODE_DBG("ws->path %d\n ", ws->path);
+    os_free(ws->path);
+  }
 
   if (ws->expectedSecKey != NULL) {
     os_free(ws->expectedSecKey);
@@ -590,17 +630,26 @@ static void disconnect_callback(void *arg) {
     os_free(ws->payloadBuffer);
   }
 
-  if (conn->proto.tcp != NULL) {
-    os_free(conn->proto.tcp);
+  if (ws->conn == conn) {
+    // this will not be the case for websocketserver created connections
+    // where the conn apparently is the server espconn and not the client...
+    // connections created by the server are also freed internally
+    if (conn->proto.tcp != NULL) {
+      os_free(conn->proto.tcp);
+    }
+
+    espconn_delete(conn);
+
+    NODE_DBG("freeing conn1 \n");
+
+    os_free(conn);
+    ws->conn = NULL;
+  } else {
+    // why are they reusing conns?? :(. The state should at the very least be cleared.
+    NODE_DBG("Restoring serverinfo = %d \n", ws->serverInfo);
+    conn->reverse = ws->serverInfo;
+    espconn_regist_sentcb(conn, sent_noop); // no other way to unregister the wsc_closeSentCallback
   }
-
-  NODE_DBG("conn %d\n", conn);
-  espconn_delete(conn);
-
-  NODE_DBG("freeing conn1 \n");
-
-  os_free(conn);
-  ws->conn = NULL;
 
   if (ws->onFailure) {
     if (ws->knownFailureCode) ws->onFailure(ws, ws->knownFailureCode);
@@ -611,7 +660,7 @@ static void disconnect_callback(void *arg) {
 static void ws_connectTimeout(void *arg) {
   NODE_DBG("ws_connectTimeout\n");
   struct espconn *conn = (struct espconn *) arg;
-  ws_info *ws = (ws_info *) conn->reverse;
+  wsc_info *ws = (wsc_info *) conn->reverse;
 
   ws->knownFailureCode = -18;
   disconnect_callback(arg);
@@ -620,7 +669,7 @@ static void ws_connectTimeout(void *arg) {
 static void error_callback(void * arg, sint8 errType) {
   NODE_DBG("error_callback %d\n", errType);
   struct espconn *conn = (struct espconn *) arg;
-  ws_info *ws = (ws_info *) conn->reverse;
+  wsc_info *ws = (wsc_info *) conn->reverse;
 
   ws->knownFailureCode = ((int) errType) - 100;
   disconnect_callback(arg);
@@ -629,7 +678,7 @@ static void error_callback(void * arg, sint8 errType) {
 static void dns_callback(const char *hostname, ip_addr_t *addr, void *arg) {
   NODE_DBG("dns_callback\n");
   struct espconn *conn = (struct espconn *) arg;
-  ws_info *ws = (ws_info *) conn->reverse;
+  wsc_info *ws = (wsc_info *) conn->reverse;
 
   if (ws->conn == NULL || ws->connectionState == 4) {
   	return;
@@ -667,11 +716,11 @@ static void dns_callback(const char *hostname, ip_addr_t *addr, void *arg) {
   NODE_DBG("DNS found %s " IPSTR " \n", hostname, IP2STR(addr));
 }
 
-void ws_connect(ws_info *ws, const char *url) {
-  NODE_DBG("ws_connect called\n");
+void wsc_connect(wsc_info *ws, const char *url) {
+  NODE_DBG("wsc_connect called\n");
 
   if (ws == NULL) {
-    NODE_DBG("ws_connect ws_info argument is null!");
+    NODE_DBG("wsc_connect wsc_info argument is null!");
     return;
   }
 
@@ -740,13 +789,14 @@ void ws_connect(ws_info *ws, const char *url) {
   NODE_DBG("port = %d\n", port);
   NODE_DBG("path = %s\n", path);
 
-  // Prepare internal ws_info
+  // Prepare internal wsc_info
   ws->connectionState = 1;
   ws->isSecure = isSecure;
   ws->hostname = c_strdup(hostname);
   ws->port = port;
   ws->path = c_strdup(path);
   ws->expectedSecKey = NULL;
+  ws->applyMask = true;
   ws->knownFailureCode = 0;
   ws->frameBuffer = NULL;
   ws->frameBufferLen = 0;
@@ -754,6 +804,7 @@ void ws_connect(ws_info *ws, const char *url) {
   ws->payloadBufferLen = 0;
   ws->payloadOriginalOpCode = 0;
   ws->unhealthyPoints = 0;
+  ws->serverInfo = NULL;
 
   // Prepare espconn
   struct espconn *conn = (struct espconn *) c_zalloc(sizeof(struct espconn));
@@ -779,15 +830,15 @@ void ws_connect(ws_info *ws, const char *url) {
   return;
 }
 
-void ws_send(ws_info *ws, int opCode, const char *message, unsigned short length) {
-  NODE_DBG("ws_send\n");
-  ws_sendFrame(ws->conn, opCode, message, length);
+void wsc_send(wsc_info *ws, int opCode, const char *message, unsigned short length) {
+  NODE_DBG("wsc_send\n");
+  wsc_sendFrame(ws->conn, opCode, message, length);
 }
 
-static void ws_forceCloseTimeout(void *arg) {
-  NODE_DBG("ws_forceCloseTimeout\n");
+static void wsc_forceCloseTimeout(void *arg) {
+  NODE_DBG("wsc_forceCloseTimeout\n");
   struct espconn *conn = (struct espconn *) arg;
-  ws_info *ws = (ws_info *) conn->reverse;
+  wsc_info *ws = (wsc_info *) conn->reverse;
 
   if (ws->connectionState == 0 || ws->connectionState == 4) {
     return;
@@ -799,8 +850,8 @@ static void ws_forceCloseTimeout(void *arg) {
     espconn_disconnect(ws->conn);
 }
 
-void ws_close(ws_info *ws) {
-  NODE_DBG("ws_close\n");
+void wsc_close(wsc_info *ws) {
+  NODE_DBG("wsc_close\n");
 
   if (ws->connectionState == 0 || ws->connectionState == 4) {
     return;
@@ -810,10 +861,213 @@ void ws_close(ws_info *ws) {
   if (ws->connectionState == 1) {
     disconnect_callback(ws->conn);
   } else {
-    ws_sendFrame(ws->conn, WS_OPCODE_CLOSE, NULL, 0);
+    wsc_sendFrame(ws->conn, WS_OPCODE_CLOSE, NULL, 0);
 
     os_timer_disarm(&ws->timeoutTimer);
-    os_timer_setfn(&ws->timeoutTimer, (os_timer_func_t *) ws_forceCloseTimeout, ws->conn);
+    os_timer_setfn(&ws->timeoutTimer, (os_timer_func_t *) wsc_forceCloseTimeout, ws->conn);
     os_timer_arm(&ws->timeoutTimer, WS_FORCE_CLOSE_TIMEOUT_MS, false);
   }
+}
+
+bool check_header_present(const char *headers,
+                          const char *header, const char *headerLowercase,
+                          const char *value, const char *valueLowercase) {
+  char *cursor = strstr(headers, header);
+  if (cursor == NULL) {
+    cursor = strstr(headers, headerLowercase);
+  }
+
+  if (cursor == NULL) {
+    NODE_DBG("HEADER NOT FOUND \n");
+    return false;
+  }
+
+  cursor += strlen(header);
+  cursor += 1; // skipping the ':'
+
+  // skip spaces, if any
+  while (*cursor == ' ') {
+    cursor++;
+  }
+
+  int valueLength = strlen(value);
+
+  return c_strncmp(cursor, value, valueLength) == 0 ||
+         c_strncmp(cursor, valueLowercase, valueLength) == 0;
+}
+
+void wss_initReceiveCallback(void *arg, char *buf, unsigned short len) {
+  NODE_DBG("wss_initReceiveCallback %d \n", len);
+  NODE_DBG("conn %d \n", arg);
+  struct espconn *conn = (struct espconn *) arg;
+  wss_info *wss = (wss_info *) conn->reverse;
+  NODE_DBG("wss = %d\n", wss);
+  NODE_DBG("conn2 = %d\n", wss->conn); // server conns
+  //conn->reverse = NULL; //todo: change this; remove wss_info reference, but will store wsc_info later
+
+  // Check if it's a get request and HTTP/1.1
+  if (c_strncasecmp(buf, "GET ", 4) != 0 || strstr(buf, "HTTP/1.1\r\n") == NULL) {
+    NODE_DBG("Rejecting client for invalid request (not a GET request nor HTTP/1.1).\n");
+    espconn_disconnect(conn);
+    return;
+  }
+
+  // Check if contains headers
+  if (!check_header_present(buf, "\r\nUpgrade", "\r\nupgrade", "Websocket", "websocket") ||
+      !check_header_present(buf, "\r\nConnection", "\r\nconnection", "Upgrade", "upgrade")) {
+    NODE_DBG("Rejecting client for missing headers.\n");
+    espconn_disconnect(conn);
+    return;
+  }
+
+  // Extract key
+  char *secKey = strstr(buf, "Sec-WebSocket-Key:");
+  if (secKey == NULL) {
+    secKey = strstr(buf, "sec-websocket-key:");
+  }
+
+  if (secKey == NULL) {
+    NODE_DBG("Rejecting client for missing Sec-WebSocket-Key.\n");
+    espconn_disconnect(conn);
+    return;
+  }
+
+  secKey += strlen("Sec-WebSocket-Key:");
+
+  // skip spaces, if any
+  while (*secKey == ' ') {
+    secKey++;
+  }
+
+  char *secKeyEnd = c_strchr(secKey, '\r');
+  *secKeyEnd = '\0';
+
+  // Extract the path
+  char *path = buf + strlen("GET ");
+  char *pathEnd = c_strchr(path, ' ');
+  *pathEnd = '\0';
+
+  if (strlen(path) == 0) {
+    NODE_DBG("Rejecting client for missing path.\n");
+    espconn_disconnect(conn);
+    return;
+  }
+
+  NODE_DBG("Path = %s \n", path);
+  NODE_DBG("SKey(%d) = %s \n", strlen(secKey), secKey);
+
+  // Generate accept key
+  char *acceptKey = NULL;
+  generateSecAcceptKey(secKey, &acceptKey);
+  NODE_DBG("Accept key = %s \n", acceptKey);
+
+  // Send response to client
+  char responseBuf[WS_INIT_SERVER_HEADERS_LENGTH + strlen(acceptKey)];
+  int responseLen = os_sprintf(responseBuf, WS_INIT_SERVER_HEADERS, acceptKey, "");
+
+  os_free(acceptKey);
+
+  NODE_DBG("sending response...\n");
+  espconn_send(conn, (uint8_t *) responseBuf, responseLen);
+
+  // Prepare internal wsc_info
+  NODE_DBG("Prepare internal wsc_info...\n");
+  wsc_info *ws = wss->onNewClientConnection(wss->reservedData);
+
+  if (ws == NULL) { // most likely due to out of memory
+    NODE_DBG("Failed receive wsc_info\n");
+    espconn_disconnect(conn);
+    return;
+  }
+
+  NODE_DBG("Prepare internal wsc_info2...\n");
+  ws->connectionState = 3;
+  ws->isSecure = false;
+  ws->hostname = NULL;
+  ws->port = conn->proto.tcp->local_port;
+  ws->path = NULL;
+  ws->expectedSecKey = NULL;
+  ws->applyMask = false; // websocket servers must not apply masking
+  ws->knownFailureCode = 0;
+  ws->frameBuffer = NULL;
+  ws->frameBufferLen = 0;
+  ws->payloadBuffer = NULL;
+  ws->payloadBufferLen = 0;
+  ws->payloadOriginalOpCode = 0;
+  ws->unhealthyPoints = 0;
+  ws->conn = conn;
+  ws->serverInfo = wss;
+  conn->reverse = ws;
+  NODE_DBG("wsc_info *ws = %d\n", ws);
+
+  os_timer_setfn(&ws->timeoutTimer, (os_timer_func_t *) wsc_sendPingTimeout, conn);
+  os_timer_arm(&ws->timeoutTimer, WS_PING_INTERVAL_MS, true);
+
+  espconn_regist_recvcb(conn, wsc_receiveCallback);
+}
+
+
+void server_client_connected_callback(void *arg) {
+  NODE_DBG("server_client_connected_callback\n");
+
+  struct espconn *conn = (struct espconn *) arg;
+  NODE_DBG("conn %d\n", conn);
+
+  espconn_regist_recvcb(conn, wss_initReceiveCallback);
+  espconn_regist_disconcb(conn, disconnect_callback);
+  espconn_regist_reconcb(conn, error_callback);
+}
+
+void wss_start(wss_info *wss) {
+  NODE_DBG("wss_start\n");
+
+  if (wss->state == 1) {
+    NODE_DBG("already started...\n");
+    return;
+  }
+
+  wss->state = 1;
+
+  // Prepare espconn
+  struct espconn *conn = (struct espconn *) c_zalloc(sizeof(struct espconn));
+
+  conn->type = ESPCONN_TCP;
+  conn->state = ESPCONN_NONE;
+  conn->proto.tcp = (esp_tcp *) c_zalloc(sizeof(esp_tcp));
+  conn->proto.tcp->local_port = wss->port;
+
+  NODE_DBG("wss = %d and ", wss);
+
+  conn->reverse = wss;
+  wss->conn = conn;
+
+  espconn_regist_connectcb(conn, server_client_connected_callback);
+  espconn_accept(conn);
+  espconn_regist_time(conn, WS_SERVER_CONNECT_TIMEOUT_MS, 0);
+
+  NODE_DBG("conn %d\n", conn);
+}
+
+void wss_close(wss_info *wss) {
+  NODE_DBG("wss_close\n");
+
+  if (wss->conn == NULL) {
+    return;
+  }
+
+  NODE_DBG("wss->conn %d\n", wss->conn);
+
+  //TODO: use espconn_get_connection_info(wss->conn) to attempt graceful connections shutdown
+  espconn_disconnect(wss->conn);
+
+  if (wss->conn->proto.tcp != NULL) {
+    os_free(wss->conn->proto.tcp);
+  }
+
+  espconn_delete(wss->conn);
+
+  os_free(wss->conn);
+
+  wss->conn = NULL;
+  wss->state = 2;
 }

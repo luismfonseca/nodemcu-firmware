@@ -37,13 +37,27 @@
 #define espconn_secure_send espconn_secure_sent
 #endif
 
-struct ws_info;
+struct wsc_info; // client info
+struct wss_info; // server info
 
-typedef void (*ws_onConnectionCallback)(struct ws_info *wsInfo);
-typedef void (*ws_onReceiveCallback)(struct ws_info *wsInfo, char *message, int opCode);
-typedef void (*ws_onFailureCallback)(struct ws_info *wsInfo, int errorCode);
+typedef void (*wsc_onConnectionCallback)(struct wsc_info *wscInfo);
+typedef void (*wsc_onReceiveCallback)(struct wsc_info *wscInfo, char *message, int opCode);
+typedef void (*wsc_onFailureCallback)(struct wsc_info *wscInfo, int errorCode);
 
-typedef struct ws_info {
+typedef struct wsc_info *(*wss_onNewClientConnectionCallback)(void *reservedData);
+
+typedef struct wss_info {
+  int state;
+
+  int port;
+
+  struct espconn *conn;
+  void *reservedData;
+
+  wss_onNewClientConnectionCallback onNewClientConnection;
+} wss_info;
+
+typedef struct wsc_info {
   int connectionState;
 
   bool isSecure;
@@ -51,8 +65,10 @@ typedef struct ws_info {
   int port;
   char *path;
   char *expectedSecKey;
+  bool applyMask;
 
   struct espconn *conn;
+  wss_info *serverInfo;
   void *reservedData;
   int knownFailureCode;
 
@@ -66,24 +82,35 @@ typedef struct ws_info {
   os_timer_t  timeoutTimer;
   int unhealthyPoints;
 
-  ws_onConnectionCallback onConnection;
-  ws_onReceiveCallback onReceive;
-  ws_onFailureCallback onFailure;
-} ws_info;
+  wsc_onConnectionCallback onConnection;
+  wsc_onReceiveCallback onReceive;
+  wsc_onFailureCallback onFailure;
+} wsc_info;
+
 
 /*
  * Attempts to estabilish a websocket connection to the given url.
  */
-void ws_connect(ws_info *wsInfo, const char *url);
+void wsc_connect(wsc_info *wscInfo, const char *url);
 
 /*
  * Sends a message with a given opcode.
  */
-void ws_send(ws_info *wsInfo, int opCode, const char *message, unsigned short length);
+void wsc_send(wsc_info *wscInfo, int opCode, const char *message, unsigned short length);
 
 /*
  * Disconnects existing conection and frees memory.
  */
-void ws_close(ws_info *wsInfo);
+void wsc_close(wsc_info *wscInfo);
+
+/*
+ * Starts the server to listen to the configured port.
+ */
+void wss_start(wss_info *wssInfo);
+
+/*
+ * Closes all existing websockets connections and then the server itself.
+ */
+void wss_close(wss_info *wssInfo);
 
 #endif // _WEBSOCKET_H_
