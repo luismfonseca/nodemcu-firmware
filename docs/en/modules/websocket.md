@@ -117,7 +117,7 @@ Registers the callback function to handle websockets events (there can be only o
 `websocket:on(eventName, function(ws, ...))`
 
 #### Parameters
-- `eventName` the type of websocket event to register the callback function. Those events are: `connection`, `receive` and `close`.
+- `eventName` the type of websocket event to register the callback function. Those events are: `connection`, `sent`, `receive` and `close`.
 - `function(ws, ...)` callback function.
 The function first parameter is always the websocketclient.
 Other arguments are required depending on the event type. See example for more details.
@@ -131,6 +131,9 @@ If `nil`, any previously configured callback is unregistered.
 local ws = websocket.createClient()
 ws:on("connection", function(ws)
   print('got ws connection')
+end)
+ws:on("sent", function(ws)
+  print('message sent')
 end)
 ws:on("receive", function(_, msg, opcode)
   print('got message:', msg, opcode) -- opcode is 1 for text message, 2 for binary

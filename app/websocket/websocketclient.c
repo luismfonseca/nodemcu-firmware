@@ -265,6 +265,19 @@ static void ws_sendFrame(struct espconn *conn, int opCode, const char *data, uns
   os_free(b);
 }
 
+static void ws_sentCallback(void *arg) {
+  NODE_DBG("ws_sentCallback \n");
+  struct espconn *conn = (struct espconn *) arg;
+  ws_info *ws = (ws_info *) conn->reverse;
+
+  if (ws == NULL) {
+    NODE_DBG("ws is unexpectedly null\n");
+    return;
+  }
+
+  if (ws->onSent) ws->onSent(ws);
+}
+
 static void ws_sendPingTimeout(void *arg) {
   NODE_DBG("ws_sendPingTimeout \n");
   struct espconn *conn = (struct espconn *) arg;
@@ -563,6 +576,7 @@ static void ws_initReceiveCallback(void *arg, char *buf, unsigned short len) {
   os_timer_arm(&ws->timeoutTimer, WS_PING_INTERVAL_MS, true);
 
   espconn_regist_recvcb(conn, ws_receiveCallback);
+  espconn_regist_sentcb(conn, ws_sentCallback);
 
   if (ws->onConnection) ws->onConnection(ws);
 
@@ -863,6 +877,8 @@ void ws_close(ws_info *ws) {
   if (ws->connectionState == 1) {
     disconnect_callback(ws->conn);
   } else {
+    espconn_regist_sentcb(ws->conn, NULL);
+
     ws_sendFrame(ws->conn, WS_OPCODE_CLOSE, NULL, 0);
 
     os_timer_disarm(&ws->timeoutTimer);

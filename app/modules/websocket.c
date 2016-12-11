@@ -24,6 +24,7 @@
 typedef struct ws_data {
   int self_ref;
   int onConnection;
+  int onSent;
   int onReceive;
   int onClose;
 } ws_data;
@@ -41,6 +42,24 @@ static void websocketclient_onConnectionCallback(ws_info *ws) {
 
   if (data->onConnection != LUA_NOREF) {
     lua_rawgeti(L, LUA_REGISTRYINDEX, data->onConnection); // load the callback function
+    lua_rawgeti(L, LUA_REGISTRYINDEX, data->self_ref);  // pass itself, #1 callback argument
+    lua_call(L, 1, 0);
+  }
+}
+
+static void websocketclient_onSentCallback(ws_info *ws) {
+  NODE_DBG("websocketclient_onSentCallback\n");
+
+  lua_State *L = lua_getstate();
+
+  if (ws == NULL || ws->reservedData == NULL) {
+    luaL_error(L, "Client websocket is nil.\n");
+    return;
+  }
+  ws_data *data = (ws_data *) ws->reservedData;
+
+  if (data->onSent != LUA_NOREF) {
+    lua_rawgeti(L, LUA_REGISTRYINDEX, data->onSent); // load the callback function
     lua_rawgeti(L, LUA_REGISTRYINDEX, data->self_ref);  // pass itself, #1 callback argument
     lua_call(L, 1, 0);
   }
@@ -97,6 +116,7 @@ static int websocket_createClient(lua_State *L) {
   // create user data
   ws_data *data = (ws_data *) luaM_malloc(L, sizeof(ws_data));
   data->onConnection = LUA_NOREF;
+  data->onSent = LUA_NOREF;
   data->onReceive = LUA_NOREF;
   data->onClose = LUA_NOREF;
   data->self_ref = LUA_NOREF; // only set when ws:connect is called
@@ -105,6 +125,7 @@ static int websocket_createClient(lua_State *L) {
   ws->connectionState = 0;
   ws->extraHeaders = NULL;
   ws->onConnection = &websocketclient_onConnectionCallback;
+  ws->onSent = &websocketclient_onSentCallback;
   ws->onReceive = &websocketclient_onReceiveCallback;
   ws->onFailure = &websocketclient_onCloseCallback;
   ws->reservedData = data;
@@ -123,7 +144,7 @@ static int websocketclient_on(lua_State *L) {
 
   ws_data *data = (ws_data *) ws->reservedData;
 
-  int handle = luaL_checkoption(L, 2, NULL, (const char * const[]){ "connection", "receive", "close", NULL });
+  int handle = luaL_checkoption(L, 2, NULL, (const char * const[]){ "connection", "sent", "receive", "close", NULL });
   if (lua_type(L, 3) != LUA_TNIL && lua_type(L, 3) != LUA_TFUNCTION && lua_type(L, 3) != LUA_TLIGHTFUNCTION) {
     return luaL_typerror(L, 3, "function or nil");
   }
@@ -141,6 +162,17 @@ static int websocketclient_on(lua_State *L) {
       }
       break;
     case 1:
+      NODE_DBG("sent\n");
+
+      luaL_unref(L, LUA_REGISTRYINDEX, data->onSent);
+      data->onSent = LUA_NOREF;
+
+      if (lua_type(L, 3) != LUA_TNIL) {
+        lua_pushvalue(L, 3);  // copy argument (func) to the top of stack
+        data->onSent = luaL_ref(L, LUA_REGISTRYINDEX);
+      }
+      break;
+    case 2:
       NODE_DBG("receive\n");
 
       luaL_unref(L, LUA_REGISTRYINDEX, data->onReceive);
@@ -151,7 +183,7 @@ static int websocketclient_on(lua_State *L) {
         data->onReceive = luaL_ref(L, LUA_REGISTRYINDEX);
       }
       break;
-    case 2:
+    case 3:
       NODE_DBG("close\n");
 
       luaL_unref(L, LUA_REGISTRYINDEX, data->onClose);
@@ -281,6 +313,7 @@ static int websocketclient_gc(lua_State *L) {
   ws_data *data = (ws_data *) ws->reservedData;
 
   luaL_unref(L, LUA_REGISTRYINDEX, data->onConnection);
+  luaL_unref(L, LUA_REGISTRYINDEX, data->onSent);
   luaL_unref(L, LUA_REGISTRYINDEX, data->onReceive);
 
   if (data->onClose != LUA_NOREF) {

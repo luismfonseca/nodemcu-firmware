@@ -40,6 +40,7 @@
 struct ws_info;
 
 typedef void (*ws_onConnectionCallback)(struct ws_info *wsInfo);
+typedef void (*ws_onSentCallback)(struct ws_info *wsInfo);
 typedef void (*ws_onReceiveCallback)(struct ws_info *wsInfo, int len, char *message, int opCode);
 typedef void (*ws_onFailureCallback)(struct ws_info *wsInfo, int errorCode);
 
@@ -73,6 +74,7 @@ typedef struct ws_info {
   int unhealthyPoints;
 
   ws_onConnectionCallback onConnection;
+  ws_onSentCallback onSent;
   ws_onReceiveCallback onReceive;
   ws_onFailureCallback onFailure;
 } ws_info;
